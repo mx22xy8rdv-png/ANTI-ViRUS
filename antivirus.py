@@ -1,5 +1,5 @@
 # language: Python, file: antivirus.py
-# Зависимости: yara-python, pefile, watchdog, cryptography, requests
+# Зависимости: yara-python, pefile, watchdog, cryptography, requests, psutil
 # Сборка: pyinstaller --noconsole --onefile --name KiwiAV antivirus.py
 
 import ctypes
@@ -43,6 +43,12 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 # ================= НАСТРОЙКИ =================
 _SALT = b"KiwiAV_Salt_2026"
 CORRECT_HASH = hashlib.sha256(_SALT + b"KIWI_121892").hexdigest()
@@ -54,7 +60,6 @@ HASH_DB_FILE = os.path.join(BASE_DIR, "hashes.txt")
 KEY_FILE = os.path.join(BASE_DIR, "quarantine.key")
 YARA_EXTRA_FILE = os.path.join(BASE_DIR, "extra_rules.yar")
 
-# Открытые источники (можно заменить на свои)
 HASH_DB_URL = "https://raw.githubusercontent.com/advanced-threat-research/malware-hashes/main/hashes.txt"
 YARA_RULES_URL = "https://raw.githubusercontent.com/Yara-Rules/rules/master/malware/MALW_AZORult.yar"
 
@@ -189,7 +194,6 @@ def entropy(data: bytes) -> float:
 
 
 def verify_signature(path: str) -> bool:
-    """Проверка цифровой подписи через WinVerifyTrust."""
     try:
         class GUID(ctypes.Structure):
             _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
@@ -204,22 +208,57 @@ def verify_signature(path: str) -> bool:
                         ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)), ("dwStateAction", ctypes.c_ulong),
                         ("hWVTStateData", ctypes.c_void_p), ("pwszURLReference", ctypes.c_wchar_p),
                         ("dwProvFlags", ctypes.c_ulong), ("dwUIContext", ctypes.c_ulong)]
-        action = GUID(0x00AAC56B, 0xCD44, 0x11d0, (ctypes.c_ubyte * 8)(0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee))
+        action = GUID(0x00AAC56B, 0xCD44, 0x11d0,
+                      (ctypes.c_ubyte * 8)(0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee))
         file_info = WINTRUST_FILE_INFO()
         file_info.cbStruct = ctypes.sizeof(WINTRUST_FILE_INFO)
         file_info.pcwszFilePath = path
         data = WINTRUST_DATA()
         data.cbStruct = ctypes.sizeof(WINTRUST_DATA)
-        data.dwUIChoice = 2  # WTD_UI_NONE
-        data.fdwRevocationChecks = 0  # WTD_REVOKE_NONE
-        data.dwUnionChoice = 1  # WTD_CHOICE_FILE
+        data.dwUIChoice = 2
+        data.fdwRevocationChecks = 0
+        data.dwUnionChoice = 1
         data.pFile = ctypes.pointer(file_info)
         data.dwStateAction = 0
-        data.dwProvFlags = 0x00000010  # WTD_CACHE_ONLY_URL_RETRIEVAL
+        data.dwProvFlags = 0x00000010
         ret = ctypes.windll.wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
         return ret == 0
     except Exception:
         return False
+
+
+def is_microsoft_signed(path: str) -> bool:
+    """Проверяет, подписан ли файл Microsoft/Windows."""
+    try:
+        if not verify_signature(path):
+            return False
+        # Получаем издателя через WinVerifyTrust + CertGetNameString — упрощённо:
+        # если подпись валидна и путь в Windows — считаем Microsoft-подписанным.
+        lower = path.lower()
+        if lower.startswith(os.environ.get("SystemRoot", "C:\\Windows").lower()):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_system_path(path: str) -> bool:
+    """Возвращает True, если файл лежит в системных папках."""
+    try:
+        lower = os.path.abspath(path).lower()
+        sysroot = os.environ.get("SystemRoot", "C:\\Windows").lower()
+        if lower.startswith(sysroot + "\\"):
+            return True
+        for p in (
+            os.environ.get("ProgramFiles", "C:\\Program Files"),
+            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            os.environ.get("ProgramData", "C:\\ProgramData"),
+        ):
+            if p and lower.startswith(p.lower() + "\\"):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 # ================= ДВИЖОК =================
@@ -295,23 +334,25 @@ class Scanner:
         except Exception:
             return result
 
-        # 1. Хеш
+        # Системные файлы не считаем malicious даже при срабатывании правил
+        system = is_system_path(path)
+        result["system"] = system
+
         h = sha256_file(path)
         if h and h in self.hash_db:
             result["verdict"] = "malicious"
             result["reasons"].append(f"Hash: {h[:16]}...")
 
-        # 2. YARA
         if self.rules:
             try:
                 matches = self.rules.match(path, timeout=15)
                 for m in matches:
                     result["reasons"].append(f"YARA: {m.rule}")
-                    result["verdict"] = "malicious"
+                    if not system:
+                        result["verdict"] = "malicious"
             except Exception as e:
                 log(f"[YARA] {path}: {e}")
 
-        # 3. Эвристика строк
         data = b""
         try:
             with open(path, "rb") as f:
@@ -319,21 +360,19 @@ class Scanner:
             for s in SUSPICIOUS_STRINGS:
                 if s in data:
                     result["reasons"].append(f"String: {s.decode('utf-8', errors='ignore')}")
-                    if result["verdict"] == "clean":
+                    if result["verdict"] == "clean" and not system:
                         result["verdict"] = "suspicious"
         except Exception:
             pass
 
-        # 4. Энтропия
-        if data and len(data) > 4096:
+        if data and len(data) > 4096 and not system:
             ent = entropy(data[:65536])
             if ent > 7.2:
                 result["reasons"].append(f"High entropy: {ent:.2f}")
                 if result["verdict"] == "clean":
                     result["verdict"] = "suspicious"
 
-        # 5. PE-эвристика
-        if HAS_PEFILE and data[:2] == b"MZ":
+        if HAS_PEFILE and data[:2] == b"MZ" and not system:
             try:
                 pe = pefile.PE(data=data, fast_load=True)
                 suspicious_sections = [b".packed", b".upx", b".aspack", b".petite"]
@@ -356,8 +395,7 @@ class Scanner:
             except Exception:
                 pass
 
-        # 6. Подпись (только для exe)
-        if path.lower().endswith(".exe") and data[:2] == b"MZ":
+        if path.lower().endswith(".exe") and data[:2] == b"MZ" and not system:
             if not verify_signature(path):
                 result["reasons"].append("PE: unsigned")
                 if result["verdict"] == "clean":
@@ -414,6 +452,9 @@ def encrypt_quarantine(path: str, dest: str) -> bool:
 def quarantine_file(path: str) -> bool:
     ensure_dirs()
     try:
+        if is_system_path(path):
+            log(f"[QUARANTINE] skip system path {path}")
+            return False
         name = os.path.basename(path)
         dest = os.path.join(QUARANTINE_DIR, f"{name}.quarantined")
         counter = 1
@@ -429,7 +470,7 @@ def quarantine_file(path: str) -> bool:
         return False
 
 
-# ================= МОНИТОР =================
+# ================= FILE MONITOR =================
 class MonitorHandler(FileSystemEventHandler):
     def __init__(self, scanner: Scanner, app):
         self.scanner = scanner
@@ -443,6 +484,126 @@ class MonitorHandler(FileSystemEventHandler):
             self.app.root.after(0, lambda: self.app.add_monitor_result(r))
 
 
+# ================= PROCESS WATCHER =================
+SYSTEM_WHITELIST = {
+    "system", "system idle process", "smss.exe", "csrss.exe", "wininit.exe",
+    "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe", "explorer.exe",
+    "dwm.exe", "taskhostw.exe", "ctfmon.exe", "fontdrvhost.exe", "spoolsv.exe",
+    "audiodg.exe", "conhost.exe", "sihost.exe", "runtimebroker.exe",
+    "searchindexer.exe", "securityhealthservice.exe", "msmpeng.exe",
+    "nissrv.exe", "python.exe", "pythonw.exe", "kiwiav.exe",
+    "taskmgr.exe", "msiexec.exe", "trustedinstaller.exe",
+    "applicationframehost.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "searchui.exe", "textinputhost.exe",
+    "wmiprvse.exe", "dllhost.exe", "spoolsv.exe", "wininit.exe",
+    "smartscreen.exe", "securityhealthsystray.exe", "useroobebroker.exe",
+    "backgroundtaskhost.exe", "lockapp.exe", "logonui.exe", "wudfhost.exe",
+}
+
+
+class ProcessWatcher:
+    def __init__(self, scanner: Scanner, app):
+        self.scanner = scanner
+        self.app = app
+        self.known_pids = set()
+        self.running = False
+        self.thread = None
+        self.own_pid = os.getpid()
+        self.own_children = set()
+
+    def _refresh_own_children(self):
+        try:
+            parent = psutil.Process(self.own_pid)
+            self.own_children = {c.pid for c in parent.children(recursive=True)}
+        except Exception:
+            self.own_children = set()
+
+    def start(self):
+        if not HAS_PSUTIL:
+            log("[PROC] psutil not installed")
+            return False
+        self.known_pids = set(psutil.pids())
+        self._refresh_own_children()
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        log("[PROC] watcher started")
+        return True
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        while self.running:
+            try:
+                current = set(psutil.pids())
+                new_pids = current - self.known_pids
+                self.known_pids = current
+                self._refresh_own_children()
+                for pid in new_pids:
+                    if not self.running:
+                        break
+                    self._check_pid(pid)
+            except Exception as e:
+                log(f"[PROC] loop error: {e}")
+            time.sleep(0.7)
+
+    def _check_pid(self, pid: int):
+        if pid == self.own_pid or pid in self.own_children:
+            return
+        try:
+            proc = psutil.Process(pid)
+            name = (proc.name() or "").lower()
+            if name in SYSTEM_WHITELIST:
+                return
+            exe = proc.exe()
+            if not exe or not os.path.exists(exe):
+                return
+            if not exe.lower().endswith((".exe", ".dll", ".scr", ".com")):
+                return
+            # Жёсткая защита: системные пути и Microsoft-подпись НЕ убиваем
+            if is_system_path(exe):
+                log(f"[PROC] skip system path {exe}")
+                return
+            if is_microsoft_signed(exe):
+                log(f"[PROC] skip MS signed {exe}")
+                return
+
+            result = self.scanner.scan_file(exe)
+            if not self.running:
+                return
+            if result.get("system"):
+                return
+            if result["verdict"] == "malicious":
+                self._kill_and_report(proc, result, kill=True)
+            elif result["verdict"] == "suspicious":
+                self._kill_and_report(proc, result, kill=False)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+        except Exception as e:
+            log(f"[PROC] check {pid}: {e}")
+
+    def _kill_and_report(self, proc, result: dict, kill: bool = True):
+        try:
+            pid = proc.pid
+            name = proc.name()
+            exe = proc.exe()
+            # Финальная страховка: не убиваем системные пути
+            if kill and is_system_path(exe):
+                log(f"[PROC] refused to kill system {exe}")
+                return
+            if kill:
+                proc.kill()
+                log(f"[PROC] KILLED {name} (pid={pid}) {result['verdict']} {exe}")
+            else:
+                log(f"[PROC] SUSPICIOUS {name} (pid={pid}) {exe}")
+            self.app.root.after(0, lambda: self.app.report_process_threat(
+                name, pid, exe, result, killed=kill))
+        except Exception as e:
+            log(f"[PROC] kill error: {e}")
+
+
+# ================= UI =================
 class AntivirusApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -452,7 +613,7 @@ class AntivirusApp:
         self.scanner = Scanner()
         self.found = []
         self.observer = None
-        self.monitor_paths = []
+        self.process_watcher = None
         self.show_login()
 
     def show_login(self):
@@ -485,9 +646,43 @@ class AntivirusApp:
         if h == CORRECT_HASH:
             self.root.unbind("<Return>")
             self.show_main_menu()
+            self._autostart_protection()
         else:
             self.key_error.config(text="❌ Неверный ключ")
             self.key_entry.delete(0, tk.END)
+
+    def _autostart_protection(self):
+        if HAS_PSUTIL:
+            self.process_watcher = ProcessWatcher(self.scanner, self)
+            if self.process_watcher.start():
+                log("[PROC] autostart")
+        if HAS_WATCHDOG:
+            self._start_file_monitor()
+
+    def _start_file_monitor(self):
+        if self.observer is not None:
+            return
+        paths = [
+            os.path.join(os.environ.get("USERPROFILE", "."), "Downloads"),
+            os.environ.get("TEMP", ""),
+            os.path.join(os.environ.get("APPDATA", "."), "Microsoft", "Windows",
+                         "Start Menu", "Programs", "Startup"),
+            os.path.join(os.environ.get("USERPROFILE", "."), "Desktop"),
+        ]
+        self.observer = Observer()
+        handler = MonitorHandler(self.scanner, self)
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    self.observer.schedule(handler, p, recursive=True)
+                    log(f"[MONITOR] watch {p}")
+                except Exception:
+                    pass
+        try:
+            self.observer.start()
+        except Exception as e:
+            log(f"[MONITOR] start error: {e}")
+            self.observer = None
 
     def show_main_menu(self):
         for w in self.root.winfo_children():
@@ -503,7 +698,8 @@ class AntivirusApp:
             ("📁 Сканировать папку", self.scan_folder),
             ("📄 Сканировать файл", self.scan_file),
             ("🧹 Полное сканирование", self.scan_full),
-            ("👁 Монитор в реальном времени", self.toggle_monitor),
+            ("👁 Монитор файлов", self.toggle_file_monitor),
+            ("🛡 Защита процессов", self.toggle_process_watcher),
             ("🔄 Обновить базы", self.update_bases),
             ("📋 Логи", self.show_logs),
             ("🚪 Выход", self.root.destroy),
@@ -513,9 +709,10 @@ class AntivirusApp:
                       bg="#2a2a2a", fg="#fff", font=("Consolas", 14),
                       bd=0, padx=20, pady=12, width=32, cursor="hand2",
                       activebackground="#3a3a3a", activeforeground="#fff").pack(pady=5)
-        self.status_label = tk.Label(self.root,
-                                     text=f"Готов. Хешей в базе: {len(self.scanner.hash_db)}",
-                                     fg="#888", bg="#1e1e1e", font=("Consolas", 11))
+        self.status_label = tk.Label(
+            self.root,
+            text=f"Готов. Хешей: {len(self.scanner.hash_db)}",
+            fg="#888", bg="#1e1e1e", font=("Consolas", 11))
         self.status_label.pack(side="bottom", pady=10)
 
     def show_scan_window(self, title: str):
@@ -573,105 +770,4 @@ class AntivirusApp:
         self._start_scan(os.environ.get("SystemDrive", "C:") + "\\", "Полное сканирование")
 
     def _start_scan(self, path: str, title: str):
-        self.found = []
-        self.show_scan_window(title)
-        self.progress_label.config(text="Сканирование...")
-
-        def worker():
-            try:
-                self.scanner.scan_path(path, callback=self.append_result,
-                                       progress=self.update_progress)
-                self.root.after(0, self._scan_done)
-            except Exception as e:
-                self.root.after(0, lambda: self.progress_label.config(
-                    text=f"Ошибка: {e}", fg="#F44336"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _scan_done(self):
-        threats = [r for r in self.found if r["verdict"] == "malicious"]
-        suspicious = [r for r in self.found if r["verdict"] == "suspicious"]
-        self.progress["value"] = 100
-        self.progress_label.config(
-            text=f"Готово. Угроз: {len(threats)}, подозрительных: {len(suspicious)}",
-            fg="#FFC107" if self.found else "#4CAF50")
-        if threats:
-            if messagebox.askyesno("Угрозы найдены",
-                                   f"Найдено угроз: {len(threats)}.\n"
-                                   f"Переместить в карантин?"):
-                for r in threats:
-                    quarantine_file(r["path"])
-
-    def toggle_monitor(self):
-        if self.observer is not None:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
-            messagebox.showinfo("Монитор", "Монитор остановлен.")
-            return
-        if not HAS_WATCHDOG:
-            messagebox.showerror("Монитор", "watchdog не установлен.")
-            return
-        paths = [
-            os.path.join(os.environ.get("USERPROFILE", "."), "Downloads"),
-            os.environ.get("TEMP", ""),
-            os.path.join(os.environ.get("APPDATA", "."), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
-            os.path.join(os.environ.get("USERPROFILE", "."), "Desktop"),
-        ]
-        self.observer = Observer()
-        handler = MonitorHandler(self.scanner, self)
-        for p in paths:
-            if p and os.path.exists(p):
-                self.observer.schedule(handler, p, recursive=True)
-                log(f"[MONITOR] watch {p}")
-        self.observer.start()
-        messagebox.showinfo("Монитор", "Монитор запущен. Слежу за Downloads, Temp, Startup, Desktop.")
-
-    def add_monitor_result(self, r: dict):
-        messagebox.showwarning("Монитор",
-                               f"Подозрительный файл:\n{r['path']}\n"
-                               f"Вердикт: {r['verdict']}\n"
-                               f"Причины: {', '.join(r['reasons'][:3])}")
-
-    def update_bases(self):
-        def worker():
-            ok = self.scanner.update_from_github()
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Обновление",
-                f"Обновление {'успешно' if ok else 'не удалось'}.\n"
-                f"Хешей: {len(self.scanner.hash_db)}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def show_logs(self):
-        for w in self.root.winfo_children():
-            w.destroy()
-        tk.Label(self.root, text="Логи", fg="#4CAF50", bg="#1e1e1e",
-                 font=("Consolas", 18, "bold")).pack(pady=10)
-        text = scrolledtext.ScrolledText(self.root, bg="#2a2a2a", fg="#ccc",
-                                         font=("Consolas", 10), height=28)
-        text.pack(fill="both", expand=True, padx=20, pady=10)
-        try:
-            if os.path.exists(LOG_FILE):
-                with open(LOG_FILE, "r", encoding="utf-8") as f:
-                    text.insert("1.0", f.read())
-            else:
-                text.insert("1.0", "Логов пока нет.")
-        except Exception as e:
-            text.insert("1.0", f"Ошибка: {e}")
-        text.config(state="disabled")
-        tk.Button(self.root, text="← Назад", command=self.show_main_menu,
-                  bg="#2a2a2a", fg="#fff", font=("Consolas", 12),
-                  bd=0, padx=20, pady=8).pack(pady=10)
-
-
-def main():
-    ensure_dirs()
-    log("=" * 50)
-    log("KiwiAV started")
-    root = tk.Tk()
-    AntivirusApp(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+        self.found =
