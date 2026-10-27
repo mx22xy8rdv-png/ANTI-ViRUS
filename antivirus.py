@@ -770,4 +770,143 @@ class AntivirusApp:
         self._start_scan(os.environ.get("SystemDrive", "C:") + "\\", "Полное сканирование")
 
     def _start_scan(self, path: str, title: str):
-        self.found =
+        self.found = []
+        self.show_scan_window(title)
+        self.progress_label.config(text="Сканирование...")
+
+        def worker():
+            try:
+                self.scanner.scan_path(path, callback=self.append_result,
+                                       progress=self.update_progress)
+                self.root.after(0, self._scan_done)
+            except Exception as e:
+                self.root.after(0, lambda: self.progress_label.config(
+                    text=f"Ошибка: {e}", fg="#F44336"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_done(self):
+        threats = [r for r in self.found if r["verdict"] == "malicious" and not r.get("system")]
+        suspicious = [r for r in self.found if r["verdict"] == "suspicious"]
+        self.progress["value"] = 100
+        self.progress_label.config(
+            text=f"Готово. Угроз: {len(threats)}, подозрительных: {len(suspicious)}",
+            fg="#FFC107" if self.found else "#4CAF50")
+        if threats:
+            if messagebox.askyesno("Угрозы найдены",
+                                   f"Найдено угроз: {len(threats)}.\n"
+                                   f"Переместить в карантин?\n"
+                                   f"(Системные файлы не будут тронуты)"):
+                for r in threats:
+                    quarantine_file(r["path"])
+
+    def toggle_file_monitor(self):
+        if self.observer is not None:
+            try:
+                self.observer.stop()
+                self.observer.join()
+            except Exception:
+                pass
+            self.observer = None
+            messagebox.showinfo("Монитор файлов", "Остановлен.")
+            return
+        if not HAS_WATCHDOG:
+            messagebox.showerror("Монитор файлов", "watchdog не установлен.")
+            return
+        self._start_file_monitor()
+        messagebox.showinfo("Монитор файлов", "Запущен. Слежу за Downloads, Temp, Startup, Desktop.")
+
+    def toggle_process_watcher(self):
+        if self.process_watcher and self.process_watcher.running:
+            self.process_watcher.stop()
+            self.process_watcher = None
+            messagebox.showinfo("Защита процессов", "Остановлена.")
+            return
+        if not HAS_PSUTIL:
+            messagebox.showerror("Защита процессов", "psutil не установлен.")
+            return
+        self.process_watcher = ProcessWatcher(self.scanner, self)
+        if self.process_watcher.start():
+            messagebox.showinfo("Защита процессов",
+                                "Запущена. Системные процессы и файлы не трогаются.")
+        else:
+            self.process_watcher = None
+            messagebox.showerror("Защита процессов", "Не удалось запустить.")
+
+    def report_process_threat(self, name, pid, exe, result, killed=True):
+        reasons = "\n".join(f"• {r}" for r in result["reasons"][:5])
+        if killed:
+            title = "KiwiAV — Угроза заблокирована"
+            text = (f"Процесс остановлен:\n\n"
+                    f"Имя: {name}\nPID: {pid}\nПуть: {exe}\n"
+                    f"Вердикт: {result['verdict']}\n\n"
+                    f"Причины:\n{reasons}")
+        else:
+            title = "KiwiAV — Подозрительный процесс"
+            text = (f"Обнаружен подозрительный процесс (не убит):\n\n"
+                    f"Имя: {name}\nPID: {pid}\nПуть: {exe}\n"
+                    f"Вердикт: {result['verdict']}\n\n"
+                    f"Причины:\n{reasons}")
+        messagebox.showwarning(title, text)
+
+    def add_monitor_result(self, r: dict):
+        messagebox.showwarning("Монитор файлов",
+                               f"Подозрительный файл:\n{r['path']}\n"
+                               f"Вердикт: {r['verdict']}\n"
+                               f"Причины: {', '.join(r['reasons'][:3])}")
+
+    def update_bases(self):
+        def worker():
+            ok = self.scanner.update_from_github()
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Обновление",
+                f"Обновление {'успешно' if ok else 'не удалось'}.\n"
+                f"Хешей: {len(self.scanner.hash_db)}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_logs(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        tk.Label(self.root, text="Логи", fg="#4CAF50", bg="#1e1e1e",
+                 font=("Consolas", 18, "bold")).pack(pady=10)
+        text = scrolledtext.ScrolledText(self.root, bg="#2a2a2a", fg="#ccc",
+                                         font=("Consolas", 10), height=28)
+        text.pack(fill="both", expand=True, padx=20, pady=10)
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    text.insert("1.0", f.read())
+            else:
+                text.insert("1.0", "Логов пока нет.")
+        except Exception as e:
+            text.insert("1.0", f"Ошибка: {e}")
+        text.config(state="disabled")
+        tk.Button(self.root, text="← Назад", command=self.show_main_menu,
+                  bg="#2a2a2a", fg="#fff", font=("Consolas", 12),
+                  bd=0, padx=20, pady=8).pack(pady=10)
+
+
+def main():
+    ensure_dirs()
+    log("=" * 50)
+    log("KiwiAV started")
+    root = tk.Tk()
+    app = AntivirusApp(root)
+
+    def on_close():
+        if app.process_watcher:
+            app.process_watcher.stop()
+        if app.observer:
+            try:
+                app.observer.stop()
+                app.observer.join()
+            except Exception:
+                pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
